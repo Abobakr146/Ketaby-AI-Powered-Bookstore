@@ -1,0 +1,147 @@
+from sqlalchemy import create_engine, text
+import pandas as pd
+from dotenv import load_dotenv
+import os
+
+# Load environment variables
+load_dotenv('data/keys.env')
+
+# Credentials
+USE_FP16 = str(os.getenv("USE_FP16")).lower() == "true"
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+engine = None  # Initialize the database engine variable
+
+def initialize_database():
+    """
+    Initializes the database connection.
+    """
+    global engine
+    if engine is None:
+        # Connect to a supabase database (or any other database of your choice)
+        engine = create_engine(
+            DATABASE_URL,
+            connect_args={"prepare_threshold": None},
+            pool_pre_ping=True,
+        )
+
+def extract_from_database(table_name):
+    """
+    Extracts data from the database.
+
+    Args:
+        table_name (str): The name of the table to extract data from.
+
+    Returns:
+        pd.DataFrame: A DataFrame containing the extracted data.
+    """
+    initialize_database()
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(text(f"SELECT * FROM {table_name}"), conn)
+            return df
+    except Exception as e:
+        print(f"Error extracting data from database => Exception: {e}")
+        return None
+
+def load(df, file_path, format = "csv"):
+    """
+    Loads a DataFrame to a specified file format (CSV or JSON).
+
+    Args:
+        df (pd.DataFrame): The DataFrame to load.
+        file_path (str): The path to the output file.
+        format (str): The format to load the DataFrame into ("csv" or "json").
+
+    Raises:
+        ValueError: If the specified format is not supported.
+    """
+    if format == "json":
+        try:
+            df.to_json(file_path, orient = "records", lines = True)
+            assert os.path.exists("data/etl/books_database_csv_etl/results/books_database.json"), "JSON file was not created."
+        except Exception as e:
+            print(f"Error loading data to JSON => Exception: {e}")
+    elif format == "csv":
+        try:
+            df.to_csv(file_path, index = False)
+            assert os.path.exists("data/etl/books_database_csv_etl/results/books_database.csv"), "CSV file was not created."
+        except Exception as e:
+            print(f"Error loading data to CSV => Exception: {e}")
+    else:
+        raise ValueError("Unsupported format. Please use 'csv' or 'json'.")
+
+def list_from_relation(df, relation_df, other_id, other_column):
+    """
+    Creates a dictionary mapping book IDs to lists of related values from another DataFrame.
+
+    Args:
+        df (pd.DataFrame): The DataFrame containing book IDs.
+        relation_df (pd.DataFrame): The DataFrame containing related values.
+        other_id (str): The column name in relation_df that corresponds to the related ID.
+        other_column (str): The column name in relation_df that contains the related values.
+
+    Returns:
+        dict: A dictionary mapping book IDs to lists of related values.
+    """
+    result = {}
+    for _, row in df.iterrows():
+        book_id = row["book_id"]
+        related_id = row[other_id]
+        related_values = relation_df[relation_df[other_id] == related_id][other_column].values[0]
+        if book_id not in result:
+            result[book_id] = []
+        result[book_id].append(related_values)
+    return result
+
+desired_columns = [
+    "book_id",
+    "title",
+    "topics",
+    "related_subjects",
+    "authors",
+    "description",
+    "average_rating",
+    "num_ratings",
+    "is_available",
+    "embedding_representation_minilm",
+    "embedding_representation_mpnet",
+]
+
+books = extract_from_database("public.books")
+authors = extract_from_database("public.authors")
+topics = extract_from_database("public.topics")
+related_subjects = extract_from_database("public.related_subjects")
+description_embeddings = extract_from_database("vector_schema.book_description_embeddings")
+books_authors = extract_from_database("public.books_authors")
+books_topics = extract_from_database("public.books_topics")
+books_related_subjects = extract_from_database("public.books_related_subjects")
+
+# for each book_id in books_authors, get the corresponding author name from authors table and column "author" and save it as a list
+book_authors = list_from_relation(books_authors, authors, "author_id", "author")
+
+# same for books_topics
+book_topics = list_from_relation(books_topics, topics, "topic_id", "topic")
+
+# same for books_related_subjects
+book_related_subjects = list_from_relation(books_related_subjects, related_subjects, "related_subject_id", "related_subject")
+
+books["authors"] = books["book_id"].apply(lambda x: book_authors.get(x, []))
+books["topics"] = books["book_id"].apply(lambda x: book_topics.get(x, []))
+books["related_subjects"] = books["book_id"].apply(lambda x: book_related_subjects.get(x, []))
+
+result = pd.merge(books, description_embeddings, on = "book_id", how = "outer")
+result['is_available'] = True  # Add a new column "is_available" and set it to True for all rows
+result = result.rename(
+    columns = {
+        "embedding_minilm": "embedding_representation_minilm",
+        "embedding_mpnet": "embedding_representation_mpnet",
+        "book_name": "title",
+        "book_average_rating": "average_rating",  
+        }
+    )
+
+result = result[desired_columns]  # Reorder the columns to match the desired order and keep only the desired columns
+
+load(result, "data/etl/books_database_csv_etl/results/books_database.json", format = "json")
+load(result, "data/etl/books_database_csv_etl/results/books_database.csv", format = "csv")
