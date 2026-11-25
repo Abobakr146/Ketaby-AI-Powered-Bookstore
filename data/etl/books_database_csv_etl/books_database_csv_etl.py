@@ -1,3 +1,5 @@
+import ast
+
 from sqlalchemy import create_engine, text
 import pandas as pd
 from dotenv import load_dotenv
@@ -58,7 +60,7 @@ def load(df, file_path, format = "csv"):
     """
     if format == "json":
         try:
-            df.to_json(file_path, orient = "records", lines = True)
+            df.to_json(file_path, orient = "records", lines = False)
             assert os.path.exists("data/etl/books_database_csv_etl/results/books_database.json"), "JSON file was not created."
         except Exception as e:
             print(f"Error loading data to JSON => Exception: {e}")
@@ -94,9 +96,23 @@ def list_from_relation(df, relation_df, other_id, other_column):
         result[book_id].append(related_values)
     return result
 
+def parse_embedding(value):
+    if isinstance(value, list):
+        return value
+    if pd.isna(value):
+        return []
+    if isinstance(value, str):
+        try:
+            result = ast.literal_eval(value.strip())
+            return result if isinstance(result, list) else []
+        except (SyntaxError, ValueError):
+            return []
+    return []
+
 desired_columns = [
     "book_id",
     "title",
+    "chapters",
     "topics",
     "related_subjects",
     "authors",
@@ -116,6 +132,7 @@ description_embeddings = extract_from_database("vector_schema.book_description_e
 books_authors = extract_from_database("public.books_authors")
 books_topics = extract_from_database("public.books_topics")
 books_related_subjects = extract_from_database("public.books_related_subjects")
+book_chapters = extract_from_database("public.book_chapter_titles")
 
 # for each book_id in books_authors, get the corresponding author name from authors table and column "author" and save it as a list
 book_authors = list_from_relation(books_authors, authors, "author_id", "author")
@@ -129,6 +146,7 @@ book_related_subjects = list_from_relation(books_related_subjects, related_subje
 books["authors"] = books["book_id"].apply(lambda x: book_authors.get(x, []))
 books["topics"] = books["book_id"].apply(lambda x: book_topics.get(x, []))
 books["related_subjects"] = books["book_id"].apply(lambda x: book_related_subjects.get(x, []))
+books["chapters"] = books["book_id"].apply(lambda x: book_chapters[book_chapters["book_id"] == x]["chapter_title"].tolist())
 
 result = pd.merge(books, description_embeddings, on = "book_id", how = "outer")
 result['is_available'] = True  # Add a new column "is_available" and set it to True for all rows
@@ -142,6 +160,10 @@ result = result.rename(
     )
 
 result = result[desired_columns]  # Reorder the columns to match the desired order and keep only the desired columns
+
+result["embedding_representation_minilm"] = (result["embedding_representation_minilm"].apply(parse_embedding))
+
+result["embedding_representation_mpnet"] = (result["embedding_representation_mpnet"].apply(parse_embedding))
 
 load(result, "data/etl/books_database_csv_etl/results/books_database.json", format = "json")
 load(result, "data/etl/books_database_csv_etl/results/books_database.csv", format = "csv")
