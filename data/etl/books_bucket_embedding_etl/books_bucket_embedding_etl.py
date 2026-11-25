@@ -25,6 +25,55 @@ model_lm12 = None  # Initialize the model variable
 model_mpnet = None  # Initialize the model variable
 # model_bge_m3 = None  # Initialize the model variable
 
+def extract_titles(pdf_path: str):
+    try:
+        with pymupdf.open(pdf_path) as doc:
+            toc = doc.get_toc() # list of [level, title, page]
+            if toc:
+                return {
+                    "source": "bookmarks",
+                    "items": [
+                        {
+                            "level": level,
+                            "title": title.strip(),
+                            "page": page
+                        }
+                        for level, title, page in toc
+                    ]
+                }
+            return {
+                "source": "none",
+                "items": [],
+            }
+    except Exception as e:
+        print(f"Failed to extract titles from {pdf_path}: {e}")
+        return {
+                "source": "error",
+                "items": [],
+        }
+
+def extract_load_titles(book, book_id):
+    try:
+        toc = extract_titles(book)
+        if toc['items']:
+            items = toc.get('items', [])
+            rows = [
+                {
+                    'book_id': book_id,
+                    **item
+                }
+                for item in items
+            ]
+            insert_stmt = text("""
+                INSERT INTO public.book_chapter_titles (book_id, chapter_title, chapter_level, chapter_page_number)
+                VALUES (:book_id, :title, :level, :page)
+                ON CONFLICT (chapter_title_id) DO NOTHING
+            """)
+            with engine.begin() as conn:
+                conn.execute(insert_stmt, rows)
+    except Exception as e:
+        print(f"Error loading book chapter titles '{book}' into the database: {e}")
+
 def initialize_models():
     global model_lm12, model_mpnet, model_bge_m3
     if model_lm12 is None:
@@ -36,21 +85,9 @@ def initialize_models():
 
 @lru_cache(maxsize = 4)
 def get_model(model):
-    """
-    Returns a cached instance of the specified SentenceTransformer model.
-
-    Args:
-        model (str): The name of the model to load.
-
-    Returns:
-        SentenceTransformer: An instance of the specified SentenceTransformer model.
-    """
     return SentenceTransformer(model)
 
 def initialize_database():
-    """
-    Initializes the database connection.
-    """
     global engine
     if engine is None:
         # Connect to a supabase database (or any other database of your choice)
@@ -59,17 +96,11 @@ def initialize_database():
             connect_args={"prepare_threshold": None},
             pool_pre_ping=True,
         )
-        with engine.begin() as conn:
-            conn.execute(text("DELETE FROM public.books"))
-            conn.execute(text("DELETE FROM vector_schema.book_vectors"))
+        # with engine.begin() as conn:
+            # conn.execute(text("DELETE FROM public.books"))
+            # conn.execute(text("DELETE FROM vector_schema.book_vectors"))
 
 def get_b2_bucket():
-    """
-    Gets the B2 bucket and download URL.
-
-    Returns:
-        list: A list containing the B2 bucket object and the download URL.
-    """
     # Authorize and connect to B2
     bucket_and_download_url = []
     info = InMemoryAccountInfo()
@@ -82,16 +113,6 @@ def get_b2_bucket():
     return bucket_and_download_url
 
 class Book:
-    """
-    A class to represent a book.
-
-    Attributes:
-        name (str): The name of the book.
-        isbn_electronic (str): The electronic ISBN of the book.
-        stored_in (str): The location where the book is stored.
-        cover_url (str): The URL of the book's cover.
-        description (str): The description of the book.
-    """
     def __init__(self, isbn_electronic = "0", name = "", stored_in = "", cover_url = "", description = ""):
         self.name = name
         self.isbn_electronic = isbn_electronic
@@ -131,17 +152,6 @@ def extract_chunks(file_path, chunk_size = 500, overlap = 50):
         return []
 
 def extract_description_chunks(words, chunk_size = 500, overlap = 50):
-    """
-    Splits a list of words into chunks of specified size with overlap.
-
-    Args:
-        words (list): The list of words to split.
-        chunk_size (int): The size of each chunk.
-        overlap (int): The number of words to overlap between chunks.
-
-    Returns:
-        list: A list of text chunks.
-    """
     try:
         chunks = []
         step = max(chunk_size - overlap, 1)  # Ensure step is at least 1 to avoid infinite loop
@@ -180,17 +190,6 @@ def transform_to_embeddings(chunks):
         return None
 
 def load_list(load, table_name, column_name):
-    """
-    Loads a list of items into the specified table and column in the database.
-
-    Args:
-        load (list): The list of items to load.
-        table_name (str): The name of the table to insert the items into.
-        column_name (str): The name of the column to insert the items into.
-
-    Returns:
-        pd.DataFrame: A DataFrame containing the loaded items.
-    """
     if not load:
         return pd.DataFrame(columns=[f"{column_name}_id", column_name])
         
@@ -218,17 +217,6 @@ def load_list(load, table_name, column_name):
         return pd.DataFrame(columns=[f"{column_name}_id", column_name])
 
 def load_relations(book_id, other_df, table_name):
-    """
-    Loads relations between a book and other entities into the database.
-
-    Args:
-        book_id (int): The ID of the book.
-        other_df (pd.DataFrame): The DataFrame containing the other entities.
-        table_name (str): The name of the table to insert the relations into.
-
-    Returns:
-        None
-    """
     if book_id is None or other_df is None or other_df.empty:
         return
         
@@ -255,13 +243,8 @@ def load_relations(book_id, other_df, table_name):
 
 def load_book(book_df):
     """
-    Loads a book's information into the database if it doesn't already exist, and returns its book_id.
-
-    Args:
-        book_df (pd.DataFrame): The DataFrame containing the book's information.
-
-    Returns:
-        int or None: The book_id of the inserted or existing book, or None if an
+    Loads a book's information into the database if it doesn't already exist,
+    and returns its book_id.
     """
     if book_df is None or book_df.empty:
         return None
@@ -295,14 +278,8 @@ def load_book(book_df):
 
 def load_embeddings(embeddings_df, book_name):
     """
-    Loads embeddings into the database.
-
-    Args:
-        embeddings_df (pd.DataFrame): The DataFrame containing the embeddings.
-        book_name (str): The name of the book for logging purposes.
-    
-    Returns:
-        None
+    Loads embeddings into vector_schema.book_vectors, skipping chunks
+    that already exist for the given book_id based on chunk_text.
     """
     if embeddings_df is None or embeddings_df.empty:
         return
@@ -362,11 +339,10 @@ def load_embeddings(embeddings_df, book_name):
 
 def load_description_embeddings(embeddings_df, book_name):
     """
-    Loads description embeddings into the database.
+    Loads embeddings into the database.
 
     Args:
         embeddings_df (pd.DataFrame): The DataFrame containing the embeddings.
-        book_name (str): The name of the book for logging purposes.
 
     Returns:
         None
@@ -430,14 +406,7 @@ def load_description_embeddings(embeddings_df, book_name):
 
 def process_books(storage, download_url):
     """
-    Extracts books and its metadata and cover from the given storage bucket and processes them into chunks.
-
-    Args:
-        storage (b2sdk.v2.Bucket): The B2 bucket object.
-        download_url (str): The download URL for the B2 bucket.
-
-    Returns:
-        None
+    Extracts books from the given storage bucket and processes them into chunks.
     """
     os.makedirs("raw_books", exist_ok=True)
     os.makedirs("raw_metadata", exist_ok=True)
@@ -523,6 +492,7 @@ def process_books(storage, download_url):
         load_relations(book_id, authors_df, "books_authors")
         load_relations(book_id, topics_df, "books_topics")
         load_relations(book_id, related_subjects_df, "books_related_subjects")
+        extract_load_titles(local_target_path, book_id)
 
         try:
             print(f"[3/5] => Extracting chunks from {local_target_path}")
