@@ -1,5 +1,6 @@
 import ast
-
+from functools import lru_cache
+from sentence_transformers import SentenceTransformer
 from sqlalchemy import create_engine, text
 import pandas as pd
 from dotenv import load_dotenv
@@ -13,6 +14,10 @@ USE_FP16 = str(os.getenv("USE_FP16")).lower() == "true"
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 engine = None  # Initialize the database engine variable
+
+@lru_cache(maxsize = 4)
+def get_model(model):
+    return SentenceTransformer(model)
 
 def initialize_database():
     """
@@ -109,6 +114,44 @@ def parse_embedding(value):
             return []
     return []
 
+def transform_to_embeddings(chunks):
+    """
+    Transforms a list of text chunks into embeddings using a pre-trained model.
+
+    Args:
+        chunks (list): A list of text chunks.
+
+    Returns:
+        numpy.ndarray: A 2D array where each row corresponds to the embedding of a chunk.
+    """
+    model_lm12 = get_model("sentence-transformers/all-MiniLM-L6-v2")
+    model_mpnet = get_model("sentence-transformers/all-mpnet-base-v2")
+    all_embeddings = []
+    try:
+        embeddings_lm12 = model_lm12.encode(chunks, batch_size = 32, show_progress_bar = True)
+        all_embeddings.append(embeddings_lm12.tolist())
+
+        embeddings_mpnet = model_mpnet.encode(chunks, batch_size = 32, show_progress_bar = True)
+        all_embeddings.append(embeddings_mpnet.tolist())
+
+        return all_embeddings
+    except Exception as e:
+        print(f"Error transforming chunks to embeddings: {e}")
+        return None
+
+def extract_text_chunks(words, chunk_size = 500, overlap = 50):
+    try:
+        chunks = []
+        step = max(chunk_size - overlap, 1)  # Ensure step is at least 1 to avoid infinite loop
+        for i in range(0, len(words), step):
+            chunk_text = " ".join(words[i:i + chunk_size])
+            if(len(chunk_text) > 0):
+                chunks.append(chunk_text)
+        return chunks
+    except Exception as e:
+        print(f"Error extracting chunks from {words}: {e}")
+        return []
+
 desired_columns = [
     "book_id",
     "title",
@@ -146,9 +189,15 @@ book_related_subjects = list_from_relation(books_related_subjects, related_subje
 books["authors"] = books["book_id"].apply(lambda x: book_authors.get(x, []))
 books["topics"] = books["book_id"].apply(lambda x: book_topics.get(x, []))
 books["related_subjects"] = books["book_id"].apply(lambda x: book_related_subjects.get(x, []))
-books["chapters"] = books["book_id"].apply(lambda x: book_chapters[book_chapters["book_id"] == x]["chapter_title"].tolist())
+chapters = books["book_id"].apply(lambda x: book_chapters[book_chapters["book_id"] == x]["chapter_title"].tolist())
+chapter_level = books["book_id"].apply(lambda x: book_chapters[book_chapters["book_id"] == x]["chapter_level"].tolist())
+books["chapters"] = [
+    [f"{title} (level {level})" for title, level in zip(titles, levels)]
+    for titles, levels in zip(chapters, chapter_level)
+]
 
-result = pd.merge(books, description_embeddings, on = "book_id", how = "outer")
+# result = pd.merge(books, description_embeddings, on = "book_id", how = "outer")
+result = books
 result['is_available'] = True  # Add a new column "is_available" and set it to True for all rows
 result = result.rename(
     columns = {
@@ -158,6 +207,30 @@ result = result.rename(
         "book_average_rating": "average_rating",  
         }
     )
+
+result["embedding_representation_minilm"] = None
+result["embedding_representation_mpnet"] = None
+
+for idx, row in result.iterrows():
+    to_be_embedded = (
+        f"Input text:\n"
+        f"Title: {row['title']}\n"
+        f"Description: {row['description']}\n"
+        f"Chapters: {', '.join(row['chapters'])}\n"
+        f"Topics: {', '.join(row['topics'])}\n"
+        f"Related Subjects: {', '.join(row['related_subjects'])}\n"
+        f"Authors: {', '.join(row['authors'])}"
+    )
+
+    chunks = extract_text_chunks(to_be_embedded.split())
+    embedded = transform_to_embeddings(chunks)
+    if embedded is None:
+        continue
+
+    # list of vectors in each cell
+    result.at[idx, "embedding_representation_minilm"] = embedded[0]
+    result.at[idx, "embedding_representation_mpnet"] = embedded[1]
+
 
 result = result[desired_columns]  # Reorder the columns to match the desired order and keep only the desired columns
 
