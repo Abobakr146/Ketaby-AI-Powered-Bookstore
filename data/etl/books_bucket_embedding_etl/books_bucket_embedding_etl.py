@@ -1,12 +1,14 @@
 import pandas as pd
 import os
 import json
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, bindparam
 from b2sdk.v2 import *
 from sentence_transformers import SentenceTransformer
-from FlagEmbedding import BGEM3FlagModel
+# from FlagEmbedding import BGEM3FlagModel
 import pymupdf  # PyMuPDF
 from dotenv import load_dotenv
+from collections import defaultdict
+from functools import lru_cache
 
 # Load environment variables
 load_dotenv()
@@ -21,7 +23,64 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 engine = None  # Initialize the database engine variable
 model_lm12 = None  # Initialize the model variable
 model_mpnet = None  # Initialize the model variable
-model_bge_m3 = None  # Initialize the model variable
+# model_bge_m3 = None  # Initialize the model variable
+
+class Book:
+    def __init__(self, isbn_electronic = "0", name = "", stored_in = "", cover_url = "", description = ""):
+        self.name = name
+        self.isbn_electronic = isbn_electronic
+        self.stored_in = stored_in
+        self.cover_url = cover_url
+        self.description = description
+
+def extract_titles(pdf_path: str):
+    try:
+        with pymupdf.open(pdf_path) as doc:
+            toc = doc.get_toc() # list of [level, title, page]
+            if toc:
+                return {
+                    "source": "bookmarks",
+                    "items": [
+                        {
+                            "level": level,
+                            "title": title.strip(),
+                            "page": page
+                        }
+                        for level, title, page in toc
+                    ]
+                }
+            return {
+                "source": "none",
+                "items": [],
+            }
+    except Exception as e:
+        print(f"Failed to extract titles from {pdf_path}: {e}")
+        return {
+                "source": "error",
+                "items": [],
+        }
+
+def extract_load_titles(book, book_id):
+    try:
+        toc = extract_titles(book)
+        if toc['items']:
+            items = toc.get('items', [])
+            rows = [
+                {
+                    'book_id': book_id,
+                    **item
+                }
+                for item in items
+            ]
+            insert_stmt = text("""
+                INSERT INTO public.book_chapter_titles (book_id, chapter_title, chapter_level, chapter_page_number)
+                VALUES (:book_id, :title, :level, :page)
+                ON CONFLICT (chapter_title_id) DO NOTHING
+            """)
+            with engine.begin() as conn:
+                conn.execute(insert_stmt, rows)
+    except Exception as e:
+        print(f"Error loading book chapter titles '{book}' into the database: {e}")
 
 def initialize_models():
     global model_lm12, model_mpnet, model_bge_m3
@@ -29,16 +88,25 @@ def initialize_models():
         model_lm12 = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")  # Load the pre-trained model
     if model_mpnet is None:
         model_mpnet = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")  # Load the pre-trained model
-    if model_bge_m3 is None:
-        model_bge_m3 = BGEM3FlagModel('BAAI/bge-m3', use_fp16=USE_FP16)  # Load the pre-trained model, use_fp16=True to use half precision for faster inference and lower memory usage
+#    if model_bge_m3 is None:
+#        model_bge_m3 = BGEM3FlagModel('BAAI/bge-m3', use_fp16=USE_FP16)  # Load the pre-trained model, use_fp16=True to use half precision for faster inference and lower memory usage
+
+@lru_cache(maxsize = 4)
+def get_model(model):
+    return SentenceTransformer(model)
 
 def initialize_database():
     global engine
     if engine is None:
-        engine = create_engine(DATABASE_URL)  # Connect to a supabase database (or any other database of your choice)
-        with engine.begin() as conn:
-            conn.execute(text("DELETE FROM public.books"))
-            conn.execute(text("DELETE FROM vector_schema.book_vectors"))
+        # Connect to a supabase database (or any other database of your choice)
+        engine = create_engine(
+            DATABASE_URL,
+            connect_args={"prepare_threshold": None},
+            pool_pre_ping=True,
+        )
+        # with engine.begin() as conn:
+            # conn.execute(text("DELETE FROM public.books"))
+            # conn.execute(text("DELETE FROM vector_schema.book_vectors"))
 
 def get_b2_bucket():
     # Authorize and connect to B2
@@ -52,14 +120,7 @@ def get_b2_bucket():
 
     return bucket_and_download_url
 
-class Book:
-    def __init__(self, isbn = 0, name = "", author = "", stored_in = ""):
-        self.name = name
-        self.isbn = isbn
-        self.author = author
-        self.stored_in = stored_in
-
-def extract_chunks(file_path, chunk_size=500, overlap=50):
+def extract_chunks(file_path, chunk_size = 500, overlap = 50):
     """
     Extracts text from a PDF file and splits it into chunks of specified size with overlap.
     
@@ -90,6 +151,19 @@ def extract_chunks(file_path, chunk_size=500, overlap=50):
         print(f"Error extracting chunks from {file_path}: {e}")
         return []
 
+def extract_description_chunks(words, chunk_size = 500, overlap = 50):
+    try:
+        chunks = []
+        step = max(chunk_size - overlap, 1)  # Ensure step is at least 1 to avoid infinite loop
+        for i in range(0, len(words), step):
+            chunk_text = " ".join(words[i:i + chunk_size])
+            if(len(chunk_text) > 0):
+                chunks.append(chunk_text)
+        return chunks
+    except Exception as e:
+        print(f"Error extracting chunks from {words}: {e}")
+        return []
+
 def transform_to_embeddings(chunks):
     """
     Transforms a list of text chunks into embeddings using a pre-trained model.
@@ -100,7 +174,8 @@ def transform_to_embeddings(chunks):
     Returns:
         numpy.ndarray: A 2D array where each row corresponds to the embedding of a chunk.
     """
-
+    model_lm12 = get_model("sentence-transformers/all-MiniLM-L6-v2")
+    model_mpnet = get_model("sentence-transformers/all-mpnet-base-v2")
     all_embeddings = []
     try:
         embeddings_lm12 = model_lm12.encode(chunks, batch_size = 32, show_progress_bar = True)
@@ -109,82 +184,160 @@ def transform_to_embeddings(chunks):
         embeddings_mpnet = model_mpnet.encode(chunks, batch_size = 32, show_progress_bar = True)
         all_embeddings.append(embeddings_mpnet.tolist())
 
-        output = model_bge_m3.encode(
-            chunks,
-            return_dense = True,
-            return_sparse = True,
-            return_colbert_vecs = False,
-            batch_size = 32
-        )
-
-        dense_vecs = output.get("dense_vecs")
-
-        if dense_vecs is None:
-            raise ValueError("BGE-M3 output did not include dense_vecs")
-        
-        # Get the first (and only) dense vectors
-        if isinstance(dense_vecs, list) and len(dense_vecs) == 1:
-            dense_vecs = dense_vecs[0]
-        
-        # Convert to list if it's a numpy array or similar
-        if hasattr(dense_vecs, "tolist"):
-            dense_vecs = dense_vecs.tolist() 
-
-        # If it's a 1D vector (single chunk), wrap it
-        if len(chunks) == 1 and isinstance(dense_vecs, list) and not isinstance(dense_vecs[0], (list, tuple)):
-            dense_vecs = [dense_vecs]  # Wrap in a list to maintain consistent shape
-
-        if len(dense_vecs) != len(chunks):
-            raise ValueError(f"Number of dense vectors ({len(dense_vecs)}) does not match number of chunks ({len(chunks)})")
-
-        dense_vectors = dense_vecs
-
-        all_embeddings.append(dense_vectors)
-
-        lexical_weights = output.get("lexical_weights")
-        formatted_sparse = []
-        for lw in lexical_weights:
-            cleaned = {str(key):float(value) for key, value in lw.items()}
-            formatted_sparse.append(json.dumps(cleaned))
-
-        if len(formatted_sparse) != len(chunks):
-            formatted_sparse = [json.dumps({})] * len(chunks)
-
-        all_embeddings.append(formatted_sparse)
-
         return all_embeddings
     except Exception as e:
         print(f"Error transforming chunks to embeddings: {e}")
         return None
 
-def load_book(book_df):
-    """
-    Loads a book's information into the database.
+def load_list(load, table_name, column_name):
+    if not load:
+        return pd.DataFrame(columns=[f"{column_name}_id", column_name])
+        
+    stmt = text(f"""
+        INSERT INTO {table_name} ({column_name})
+        VALUES (:value)
+        ON CONFLICT ({column_name}) DO NOTHING
+    """)
+    select_stmt = text(f"""
+        SELECT *
+        FROM {table_name}
+        WHERE {column_name} IN :values
+    """).bindparams(bindparam("values", expanding=True))
+    
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                stmt,
+                [{"value": item} for item in load],
+            )
+            
+            return pd.read_sql(select_stmt, conn, params={"values": load})
+    except Exception as e:
+        print(f"Error loading list to table '{table_name}' => Exception: {e}")
+        return pd.DataFrame(columns=[f"{column_name}_id", column_name])
 
-    Args:
-        book_df (pd.DataFrame): The DataFrame containing the book's information.
+def load_relations(book_id, other_df, table_name):
+    if book_id is None or other_df is None or other_df.empty:
+        return
+        
+    first_col = other_df.columns[0]
+    df = other_df[[first_col]].copy()
+    df["book_id"] = book_id
 
-    Returns:
-        int: The id of the loaded book.
-    """
+    stmt = text(f"""
+        INSERT INTO {table_name} (book_id, {first_col})
+        VALUES (:book_id, :other_id)
+        ON CONFLICT (book_id, {first_col}) DO NOTHING
+    """)
+
+    data = [{'book_id': row['book_id'], 'other_id': row[first_col]} for _, row in df.iterrows()]
 
     try:
         with engine.begin() as conn:
-            book_df.to_sql('books', con = conn, schema = 'public', if_exists = 'append', index = False)
-            print(f"Book '{book_df['book_name'][0]}' loaded into the database.")
-
-            # return the book's id from the database
-            name = str(book_df["book_name"].iloc[0])
-            result = conn.execute(
-                text("SELECT book_id FROM public.books WHERE book_name = :name ORDER BY book_id DESC LIMIT 1"),{"name": name},
+            conn.execute(
+                stmt,
+                data,
             )
-            book_id = result.scalar_one_or_none()
+    except Exception as e:
+        print(f"Error loading relations to table '{table_name}' => Exception: {e}")
+
+def load_book(book_df):
+    """
+    Loads a book's information into the database if it doesn't already exist,
+    and returns its book_id.
+    """
+    if book_df is None or book_df.empty:
+        return None
+
+    row = book_df.iloc[0].to_dict()
+
+    # Adjust the conflict target (e.g., isbn_electronic or book_name) to match a UNIQUE constraint in public.books
+    insert_stmt = text("""
+        INSERT INTO public.books (isbn_electronic, book_name, stored_in, cover_url, description)
+        VALUES (:isbn_electronic, :book_name, :stored_in, :cover_url, :description)
+        ON CONFLICT (isbn_electronic) DO NOTHING
+    """)
+
+    select_stmt = text("""
+        SELECT book_id
+        FROM public.books
+        WHERE book_name = :book_name AND isbn_electronic = :isbn_electronic
+        ORDER BY book_id DESC
+        LIMIT 1
+    """)
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(insert_stmt, row)
+            book_id = conn.execute(select_stmt, {"book_name": row["book_name"], "isbn_electronic": row['isbn_electronic']}).scalar_one_or_none()
+            print(f"Book '{row['book_name']}' ready with book_id={book_id}.")
             return book_id
     except Exception as e:
-        print(f"Error loading book '{book_df['book_name'][0]}' into the database: {e}")
+        print(f"Error loading book '{row.get('book_name', '')}' into the database: {e}")
         return None
 
 def load_embeddings(embeddings_df, book_name):
+    """
+    Loads embeddings into vector_schema.book_vectors, skipping chunks
+    that already exist for the given book_id based on chunk_text.
+    """
+    if embeddings_df is None or embeddings_df.empty:
+        return
+
+    try:
+        book_id = int(embeddings_df["book_id"].iloc[0])
+
+        with engine.begin() as conn:
+            existing_rows = conn.execute(
+                text("""
+                    SELECT chunk_text
+                    FROM vector_schema.book_vectors
+                    WHERE book_id = :book_id
+                """),
+                {"book_id": book_id},
+            ).fetchall()
+            existing_texts = {row[0] for row in existing_rows}
+
+            data = []
+            seen_in_batch = set()
+
+            for _, row in embeddings_df.iterrows():
+                chunk_text = row["chunk_text"]
+                if chunk_text in existing_texts or chunk_text in seen_in_batch:
+                    continue
+                seen_in_batch.add(chunk_text)
+
+                data.append({
+                    "book_id": row["book_id"],
+                    "chunk_title": row["chunk_title"],
+                    "chunk_text": chunk_text,
+                    "embedding_minilm": str(row["embedding_minilm"]),
+                    "embedding_mpnet": str(row["embedding_mpnet"]),
+                })
+
+            if not data:
+                print(f"All embeddings for book '{book_name}' already exist; skipped.")
+                return
+
+            conn.execute(
+                text("""
+                    INSERT INTO vector_schema.book_vectors
+                    (book_id, chunk_title, chunk_text, embedding_minilm, embedding_mpnet)
+                    VALUES (
+                        :book_id,
+                        :chunk_title,
+                        :chunk_text,
+                        CAST(:embedding_minilm AS vector),
+                        CAST(:embedding_mpnet AS vector)
+                    )
+                """),
+                data,
+            )
+        print(f"Loaded {len(data)} new embeddings for book '{book_name}' into the database.")
+    except Exception as e:
+        print(f"Error loading embeddings for book '{book_name}' into the database: {e}")
+
+def load_description_embeddings(embeddings_df, book_name):
     """
     Loads embeddings into the database.
 
@@ -195,114 +348,193 @@ def load_embeddings(embeddings_df, book_name):
         None
     """
 
+    if embeddings_df is None or embeddings_df.empty:
+        return
+
     try:
-        data = []
-        for _, row in embeddings_df.iterrows():
-            data.append({
-                "book_id": row["book_id"],
-                "chunk_title": row["chunk_title"],
-                "chunk_text": row["chunk_text"],
-                "embedding_minilm": str(row["embedding_minilm"]),
-                "embedding_mpnet": str(row["embedding_mpnet"]),
-                "embedding_bge_dense": str(row["embedding_bge_dense"]),
-                "embedding_bge_sparse": row["embedding_bge_sparse"],
-            })
+        book_id = int(embeddings_df["book_id"].iloc[0])
+
         with engine.begin() as conn:
+            existing_rows = conn.execute(
+                text("""
+                    SELECT chunk_text
+                    FROM vector_schema.book_description_embeddings
+                    WHERE book_id = :book_id
+                """),
+                {"book_id": book_id},
+            ).fetchall()
+            existing_texts = {row[0] for row in existing_rows}
+
+            data = []
+            seen_in_batch = set()
+
+            for _, row in embeddings_df.iterrows():
+                chunk_text = row["chunk_text"]
+                if chunk_text in existing_texts or chunk_text in seen_in_batch:
+                    continue
+                seen_in_batch.add(chunk_text)
+
+                data.append({
+                    "book_id": row["book_id"],
+                    "chunk_title": row["chunk_title"],
+                    "chunk_text": chunk_text,
+                    "embedding_minilm": str(row["embedding_minilm"]),
+                    "embedding_mpnet": str(row["embedding_mpnet"]),
+                })
+
+            if not data:
+                print(f"Description embeddings for book '{book_name}' already exist; skipped.")
+                return
+
             conn.execute(
-              text("""
-                INSERT INTO vector_schema.book_vectors 
-                (book_id, chunk_title, chunk_text, embedding_minilm, embedding_mpnet, embedding_bge_dense, embedding_bge_sparse) 
-                VALUES (
-                    :book_id, 
-                    :chunk_title, 
-                    :chunk_text, 
-                    CAST(:embedding_minilm AS vector), 
-                    CAST(:embedding_mpnet AS vector), 
-                    CAST(:embedding_bge_dense AS vector), 
-                    CAST(:embedding_bge_sparse AS jsonb)
-                )
-            """), 
+                text("""
+                    INSERT INTO vector_schema.book_description_embeddings
+                    (book_id, chunk_title, chunk_text, embedding_minilm, embedding_mpnet)
+                    VALUES (
+                        :book_id,
+                        :chunk_title,
+                        :chunk_text,
+                        CAST(:embedding_minilm AS vector),
+                        CAST(:embedding_mpnet AS vector)
+                    )
+                """),
                 data,
             )
-        print(f"Embeddings for book '{book_name}' loaded into the database.")
+        print(f"Loaded {len(data)} new description embeddings for book '{book_name}' into the database.")
     except Exception as e:
-        print(f"Error loading embeddings for book '{book_name}' into the database: {e}")
+        print(f"Error loading description embeddings for book '{book_name}' into the database: {e}")
 
 def process_books(storage, download_url):
     """
     Extracts books from the given storage bucket and processes them into chunks.
-
-    Args:
-        storage (b2sdk.v2.Bucket): The Backblaze B2 storage bucket object.
-        download_url (str): The download URL for the storage bucket.
-
-    Returns:
-        None
     """
+    os.makedirs("raw_books", exist_ok=True)
+    os.makedirs("raw_metadata", exist_ok=True)
 
-    # load books from backblaze storage bucket
-    os.makedirs('raw', exist_ok = True)
-    for file_version, folder_name in storage.ls(recursive = True): # recursive = True to get all files in the bucket
-        # recursive = False to get only the files in the root directory of the bucket
-        if file_version is None or not file_version.file_name.endswith('.pdf'):
+    books_by_key = defaultdict(dict)
+
+    # First pass: group .pdf, _metadata.json, and _cover.jpg files by book key
+    for file_version, _ in storage.ls(recursive=True):
+        if file_version is None:
             continue
-        
+
         remote_name = file_version.file_name
-        local_name = os.path.basename(remote_name)
+        stem, ext = os.path.splitext(remote_name)
+        ext = ext.lower()
 
-        # put the file in the raw folder
-        local_target_path = os.path.join('raw', local_name)
+        if ext == ".pdf":
+            books_by_key[stem]["pdf"] = remote_name
+        elif ext == ".json" and stem.endswith("_metadata"):
+            base_key = stem[: -len("_metadata")]
+            books_by_key[base_key]["json"] = remote_name
+        elif ext in {".jpg", ".jpeg", ".png"} and stem.endswith("_cover"):
+            base_key = stem[: -len("_cover")]
+            books_by_key[base_key]["cover"] = remote_name
 
-        print(f"\n[1/5] => Downloading {remote_name} to {local_target_path}")
-        download_dest = storage.download_file_by_name(remote_name)
+    # Second pass: process each complete book entry once
+    for _, files in books_by_key.items():
+        if "pdf" not in files:
+            continue
+
+        book = Book()
+        authors_df = pd.DataFrame(columns=["author_id", "author"])
+        topics_df = pd.DataFrame(columns=["topic_id", "topic"])
+        related_subjects_df = pd.DataFrame(columns=["related_subject_id", "related_subject"])
+
+        if "cover" in files:
+            book.cover_url = f"{download_url}/file/{storage.name}/{files['cover']}"
+
+        if "json" in files:
+            meta_remote_name = files["json"]
+            meta_local_target_path = os.path.join(
+                "raw_metadata", os.path.basename(meta_remote_name)
+            )
+            download_meta = storage.download_file_by_name(meta_remote_name)
+            download_meta.save_to(meta_local_target_path)
+
+            with open(meta_local_target_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+
+            book.name = metadata.get("title", "")
+            book.isbn_electronic = metadata.get("isbn_electronic", "0")
+            book.description = metadata.get("description", "")
+
+            authors = [item for item in metadata.get("authors", []) if item]
+            topics = [item for item in metadata.get("topics", []) if item]
+            related_subjects = [item for item in metadata.get("related_subjects", []) if item]
+
+            authors_df = load_list(authors, "authors", "author")
+            topics_df = load_list(topics, "topics", "topic")
+            related_subjects_df = load_list(related_subjects, "related_subjects", "related_subject")
+
+        pdf_remote_name = files["pdf"]
+        local_target_path = os.path.join("raw_books", os.path.basename(pdf_remote_name))
+
+        print(f"\n[1/5] => Downloading {pdf_remote_name} to {local_target_path}")
+        download_dest = storage.download_file_by_name(pdf_remote_name)
         download_dest.save_to(local_target_path)
-        
-        
-        book = Book() # create a book object to store the book's information
 
-        # get book's link in the bucket
-        book.stored_in = f"{download_url}/file/{storage.name}/{file_version.file_name}"
-        # get book's name and author from the file name
-        book.name = local_name.split('.')[0]
+        book.stored_in = f"{download_url}/file/{storage.name}/{pdf_remote_name}"
 
         book_df = pd.DataFrame(
             {
-                "isbn": [book.isbn],
+                "isbn_electronic": [book.isbn_electronic],
                 "book_name": [book.name],
-                "author": [book.author],
                 "stored_in": [book.stored_in],
+                "cover_url": [book.cover_url],
+                "description": [book.description],
             }
         )
 
         print(f"[2/5] => Loading book '{book.name}' into the database")
-        book_id = load_book(book_df) # load the book's information into the database
+        book_id = load_book(book_df)
+
+        load_relations(book_id, authors_df, "books_authors")
+        load_relations(book_id, topics_df, "books_topics")
+        load_relations(book_id, related_subjects_df, "books_related_subjects")
+        extract_load_titles(local_target_path, book_id)
 
         try:
             print(f"[3/5] => Extracting chunks from {local_target_path}")
-            chunks = extract_chunks(local_target_path) # get the chunks from the pdf file
+            chunks = extract_chunks(local_target_path)
+            description_chunks = extract_description_chunks((book.description or "").split())
 
             print(f"[4/5] => Transforming {len(chunks)} chunks into embeddings")
-            
-            embeddings = transform_to_embeddings(chunks) # transform the chunks into embeddings
+            embeddings = transform_to_embeddings(chunks)
+            if not embeddings or not chunks:
+                continue
+
             embeddings_df = pd.DataFrame(
                 {
                     "book_id": [book_id] * len(chunks),
                     "chunk_title": [f"Chunk {i+1}" for i in range(len(chunks))],
                     "chunk_text": chunks,
                     "embedding_minilm": [embeddings[0][i] for i in range(len(chunks))],
-                    "embedding_mpnet": [embeddings[1][i] for i in range(len(chunks))],
-                    "embedding_bge_dense": [embeddings[2][i] for i in range(len(chunks))],
-                    "embedding_bge_sparse": [embeddings[3][i] for i in range(len(chunks))],  # Store the same sparse weights for each chunk
+                    "embedding_mpnet": [embeddings[1][i] for i in range(len(chunks))]
                 }
             )
 
-            print(f"[5/5] => Loading embeddings into supabase pgvector")
-            load_embeddings(embeddings_df, book.name) # load the embeddings into the database
+            if description_chunks:
+                description_embeddings = transform_to_embeddings(description_chunks)
+                if description_embeddings:
+                    n_desc = len(description_chunks)
+                    description_embeddings_df = pd.DataFrame({
+                            "book_id": [book_id] * n_desc,
+                            "chunk_title": [f"Chunk {i+1}" for i in range(n_desc)],
+                            "chunk_text": description_chunks,
+                            "embedding_minilm": [description_embeddings[0][i] for i in range(n_desc)],
+                            "embedding_mpnet": [description_embeddings[1][i] for i in range(n_desc)],
+                    })
+                    load_description_embeddings(description_embeddings_df, book.name)
+
+            print("[5/5] => Loading embeddings into supabase pgvector")
+            load_embeddings(embeddings_df, book.name)
         except Exception as e:
-            print(f"Error extracting chunks from {local_target_path}: {e}")
+            print(f"Error processing {local_target_path}: {e}")
 
 def main():
-    initialize_models()  # Initialize the models
+    global model_lm12, model_mpnet
+    # initialize_models()  # Initialize the models
     initialize_database()  # Initialize the database connection
     bucket_object = get_b2_bucket()  # Get the B2 bucket object
     bucket = bucket_object[0]  # Get the bucket object from the returned list
