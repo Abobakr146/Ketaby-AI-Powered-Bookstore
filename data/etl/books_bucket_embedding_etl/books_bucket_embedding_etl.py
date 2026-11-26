@@ -25,6 +25,14 @@ model_lm12 = None  # Initialize the model variable
 model_mpnet = None  # Initialize the model variable
 # model_bge_m3 = None  # Initialize the model variable
 
+class Book:
+    def __init__(self, isbn_electronic = "0", name = "", stored_in = "", cover_url = "", description = ""):
+        self.name = name
+        self.isbn_electronic = isbn_electronic
+        self.stored_in = stored_in
+        self.cover_url = cover_url
+        self.description = description
+
 def extract_titles(pdf_path: str):
     try:
         with pymupdf.open(pdf_path) as doc:
@@ -111,14 +119,6 @@ def get_b2_bucket():
     bucket_and_download_url.append(b2_api.account_info.get_download_url())
 
     return bucket_and_download_url
-
-class Book:
-    def __init__(self, isbn_electronic = "0", name = "", stored_in = "", cover_url = "", description = ""):
-        self.name = name
-        self.isbn_electronic = isbn_electronic
-        self.stored_in = stored_in
-        self.cover_url = cover_url
-        self.description = description
 
 def extract_chunks(file_path, chunk_size = 500, overlap = 50):
     """
